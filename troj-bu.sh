@@ -38,6 +38,7 @@
 #}
 
 CONF_FL=${1:-backup-troj.conf}
+SSH_LOCAL_CONF="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
 
 REMOTE_HOST=$(docker context inspect | jq '.[].Endpoints.docker.Host' \
         |sed 's/"//g'|sed 's/^.*\/\///') 
@@ -45,8 +46,8 @@ REMOTE_HOST=$(docker context inspect | jq '.[].Endpoints.docker.Host' \
 ## GLOBAL VARS
 BU_DIR=$(jq -r '.conf?.bu_dir?' "$CONF_FL")
 
-IMAGE_BU=bu-troj:local   #name of image for throwaway backup container, name:tag format
-CONT_BU=bu-troj
+IMAGE_BU=troj-bu:local   #name of image for throwaway backup container, name:tag format
+CONT_BU=troj-bu
 
 function create_bu_image {
 				#service throwaway container with 
@@ -95,11 +96,18 @@ function get_source_dir_spec {
 				echo "$vol_spec"
 }
 
-function rw {
-				#get raw value
-				echo "$CHK" | jq -r "$1"
+function remove_bu_container {
+		if docker ps -a --format "{{ .Names }}" | grep $CONT_BU -q; then
+				log 5 "removing existing container $CONT_BU"
+		    docker rm -f "$CONT_BU" 1>/dev/null
+		fi
 }
 
+function check_container_is_on {
+		docker ps -a --format "{{json .}}"| jq -r ".|select(.Names == \"$CONT_BU\").Status?" \
+						|grep -iq '^Up'
+		ssh 
+}
 ########################################################################################
 function sql-bu {
              # ARGS:
@@ -119,11 +127,13 @@ function sql-bu {
           && log 5 "local file recorded:" && log 0 "$(ls -lh $arch_file)"
 }
 
+
 function rsync-bu {
         # ARGS:
 				# 1. name of "master" container for which backup is done
 				# 2. JSON object with parameters
         create_bu_image
+				remove_bu_container
 
 				bu_cont="$1"
 				src_dirs="$(echo "$2" | jq -r .src[])"
@@ -133,8 +143,8 @@ function rsync-bu {
 					local mount_dirs="$(docker inspect ${1}|jq -r '.[].Mounts[]')"
 
 					src_dirs=$(get_source_dir_spec "$mount_dirs" "$src_dirs")
-					echo "$IMAGE_BU"
-					echo "$src_dirs"
+					#echo "$IMAGE_BU"
+					#echo "$src_dirs"
 
 
 					docker run -d \
@@ -147,14 +157,23 @@ function rsync-bu {
 									-e USER_NAME=${bu_username}\
 									-e PUBLIC_KEY="$(cat ~/.ssh/id_rsa.pub)" \
 									-p 2222:2222 \
-									$IMAGE_BU
+									$IMAGE_BU &  || return
 
-					echo "got here"
-					return
+#					while ! check_container_is_on; do
+#									sleep 1
+#					done
+					while ! ssh -p2222 -J ${REMOTE_HOST} ${SSH_LOCAL_CONF} time ; do
+									echo "no connection"
+									sleep 1
+					done
+					echo "R E S U M E"
 
-					for src_dir in "${src_dirs}"; do
-									rsync --rsh="ssh -p2222 -J ${REMOTE_HOST}"  ${bu_username}@localhost:/${src_dir}  \
-													${bu_local_dir}/
+					for src_dir in $(echo $src_dirs|sed 's/-v/\n/g'|sed '/^ *$/d'|sed 's/.*://'); do
+									echo "!!!>${src_dir}<"
+
+rsync --rsh="ssh -p2222 -J ${REMOTE_HOST} ${SSH_LOCAL_CONF}" -avzH --delete "${bu_username}@localhost:${src_dir}" "${bu_local_dir}/" 
+#rsync_cmd=(	rsync --rsh="ssh -p2222 -J ${REMOTE_HOST} -o UserKnownHostsFile=/dev/null  -o StrictHostKeyChecking=no" -avzH -vvv --delete "${bu_username}@localhost:${src_dir}"  "${bu_local_dir}/" )
+#         printf '%q\n' "${rsync_cmd[@]}"
 					done
 }
 
@@ -164,16 +183,16 @@ log  0 "start job for remote host $REMOTE_HOST"
 
 
 for bu_cont in $(jq -r '.containers|keys[]' "$CONF_FL"); do
-				for task_k in $(jq -r ".containers[\"${bu_cont}\"].tasks|keys[]" "$CONF_FL"); do
-								#echo "2nd"
-								task=$(jq -r ".containers[\"${bu_cont}\"].tasks[$task_k]" "$CONF_FL")
-								case $(echo "${task}" | jq -r ".driver") in
-												"mysqldump")
-																sql-bu "$bu_cont" "$task"
-																;;
-												"rsync")
-																rsync-bu "$bu_cont" "$task"
-																;;
-								esac
-				done
+		for task_k in $(jq -r ".containers[\"${bu_cont}\"].tasks|keys[]" "$CONF_FL"); do
+			#echo "2nd"
+			task=$(jq -r ".containers[\"${bu_cont}\"].tasks[$task_k]" "$CONF_FL")
+			case $(echo "${task}" | jq -r ".driver") in
+				"mysqldump")
+								sql-bu "$bu_cont" "$task"
+								;;
+				"rsync")
+								rsync-bu "$bu_cont" "$task"
+								;;
+			esac
+		done
 done
