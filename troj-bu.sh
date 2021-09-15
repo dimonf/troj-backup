@@ -42,6 +42,7 @@ SSH_LOCAL_CONF="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
 
 REMOTE_HOST=$(docker context inspect | jq '.[].Endpoints.docker.Host' \
         |sed 's/"//g'|sed 's/^.*\/\///') 
+REMOTE_HOST=bird.lan
 
 ## GLOBAL VARS
 BU_DIR=$(jq -r '.conf?.bu_dir?' "$CONF_FL")
@@ -53,9 +54,10 @@ function create_bu_image {
 				#service throwaway container with 
 				# - access from outside via local sshd server
 				# - access to local resources (dirs) for backup
-        docker image ls --format "{{.Repository}}:{{.Tag}}" | grep -q $IMAGE_BU && return
+        ssh ${REMOTE_HOST} docker image ls --format "{{.Repository}}:{{.Tag}}" \
+								| grep -q $IMAGE_BU && return
         echo "    creating image $IMAGE_BU for backup container ($CONT_BU)"
-        docker build -t $IMAGE_BU - << DOCKERFILE_END
+        ssh ${REMOTE_HOST} docker build -t $IMAGE_BU - << DOCKERFILE_END
 FROM linuxserver/openssh-server
 RUN apk add --no-cache --upgrade rsync gocryptfs
 DOCKERFILE_END
@@ -97,9 +99,9 @@ function get_source_dir_spec {
 }
 
 function remove_bu_container {
-		if docker ps -a --format "{{ .Names }}" | grep $CONT_BU -q; then
+		if ssh ${REMOTE_HOST} docker ps -a  | grep $CONT_BU -q; then
 				log 5 "removing existing container $CONT_BU"
-		    docker rm -f "$CONT_BU" 1>/dev/null
+		    ssh ${REMOTE_HOST} docker rm -f "$CONT_BU" 1>/dev/null
 		fi
 }
 
@@ -122,7 +124,8 @@ function sql-bu {
 				 arch_file=$(bu-local-dir "$1" "$2")_backup.sql.gz
   log 5 "mysqldump| host:$db_cont / database:$db_name"
   
-  docker exec "$db_cont" mysqldump -u "$db_username" "-p${db_password}"  ${db_name} \
+  ssh ${REMOTE_HOST} docker exec "$db_cont" \
+					mysqldump -u "$db_username" "-p${db_password}"  ${db_name} \
           |gzip > "$arch_file"  \
           && log 5 "local file recorded:" && log 0 "$(ls -lh $arch_file)"
 }
@@ -140,14 +143,14 @@ function rsync-bu {
 				bu_local_dir=$(bu-local-dir "$1" "$2") 
 				bu_username="monkey"
 
-					local mount_dirs="$(docker inspect ${1}|jq -r '.[].Mounts[]')"
+					local mount_dirs="$(ssh ${REMOTE_HOST} docker inspect ${1}|jq -r '.[].Mounts[]')"
 
 					src_dirs=$(get_source_dir_spec "$mount_dirs" "$src_dirs")
 					#echo "$IMAGE_BU"
 					#echo "$src_dirs"
 
 
-					docker run -d \
+	                docker_cmd=" docker run -d \
 									--name=$CONT_BU \
 									$src_dirs \
 									-e PUID=1001 \
@@ -155,14 +158,17 @@ function rsync-bu {
 									-e PASSWORD_ACCESS=true \
 									-e USER_PASSWORD=boo \
 									-e USER_NAME=${bu_username}\
-									-e PUBLIC_KEY="$(cat ~/.ssh/id_rsa.pub)" \
+									-e PUBLIC_KEY=\"$(cat ~/.ssh/id_rsa.pub)\" \
 									-p 2222:2222 \
-									$IMAGE_BU &  || return
+									$IMAGE_BU "
+									echo "$docker_cmd"
+                  ssh ${REMOTE_HOST}  "$docker_cmd"
 
 #					while ! check_container_is_on; do
 #									sleep 1
 #					done
-					while ! ssh -p2222 -J ${REMOTE_HOST} ${SSH_LOCAL_CONF} time ; do
+          sleep 5
+					while ! ssh -vv -p2222 -J ${REMOTE_HOST} ${SSH_LOCAL_CONF} time ; do
 									echo "no connection"
 									sleep 1
 					done
