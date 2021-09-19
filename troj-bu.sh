@@ -4,8 +4,10 @@
 
 #ARGS:
 # - config file. backup-troj.conf by default
-# - mode: backup|bu - backup mode (default
-#         restore - restore mode
+# - --restore: "restore" mode ("backup" mode by default)
+# - -t|--tag: tags separated by comma to include. default - all tasks
+#             Note: tag is attribute of a task
+# - -n|--name: container name(s), separated by comma. default - all containers
 
 bu_mode="bu"
 while [[ $# -gt 0 ]]; do
@@ -14,7 +16,15 @@ while [[ $# -gt 0 ]]; do
     				--restore)
 							bu_mode="restore"
 							shift ;;
-	      		        *)
+				    -t|--tags)
+				      TAGS="$2"
+							shift
+							shift ;;
+				    -n|--names)
+				      CONTAINERS="$2"
+							shift
+							shift ;;
+	      		 *)
 							config_file="$key"
 							shift ;;
         esac
@@ -56,7 +66,7 @@ done
 #  }
 #}
 CONF_FL=${config_file:-backup-troj.conf}
-SSH_LOCAL_CONF="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
+SSH_LOCAL_CONF="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR"
 
 REMOTE_HOST=$(docker context inspect | jq '.[].Endpoints.docker.Host' \
         |sed 's/"//g'|sed 's/^.*\/\///') 
@@ -131,33 +141,40 @@ function check_container_is_on {
 		ssh 
 }
 ########################################################################################
-function mysqldump-bu {
+function mysqldump {
              # ARGS:
 						 # 1. name of "master" container for which backup is done
 				     # 2. JSON object with parameters
+						 # 3. mode: bu|restore
 						 #echo "$2" && return
-             bu_cont="$1"
-             db_cont=$(echo "$2" | jq -r .container)
-             db_name=$(echo "$2" | jq -r .db)
-         db_username=$(echo "$2" | jq -r .username)
-         db_password=$(echo "$2" | jq -r .password)
-				 arch_file=$(bu-local-dir "$1" "$2")_backup.sql.gz
-  log 5 "mysqldump| host:$db_cont / database:$db_name"
+       local bu_cont="$1"
+       local db_cont=$(echo "$2" | jq -r .container)
+       local db_name=$(echo "$2" | jq -r .db)
+   local db_username=$(echo "$2" | jq -r .username)
+   local db_password=$(echo "$2" | jq -r .password)
+     local arch_file=$(bu-local-dir "$1" "$2")_backup.sql.gz
+  log 5 "mysqldump, $3| host:$db_cont / database:$db_name"
   
-  ssh ${REMOTE_HOST} docker exec "$db_cont" \
+	if [[ $3 == "bu" ]]; then
+			ssh ${REMOTE_HOST} docker exec "$db_cont" \
 					mysqldump -u "$db_username" "-p${db_password}"  ${db_name} \
-          |gzip > "$arch_file"  \
-          && log 5 "local file recorded:" && log 0 "$(ls -lh $arch_file)"
+					|gzip > "$arch_file"  \
+					&& log 5 "local file recorded:" && log 0 "$(ls -lh $arch_file)"
+  else
+      #check that user exists in the database
+      ssh ${REMOTE_HOST} docker exec "$db_cont" \
+							mysql -u $db_username -p"${db_password}" || return
+			gunzip -c $arch_file | ssh ${REMOTE_HOST} "docker exec -i $db_cont sh -c \"mysql -u $db_username -p${db_password} ${db_name}\" " \
+							&& log 5 "database was restored from local file $arch_file"
+	fi
+
 }
 
-function mysqldump-restore {
-      echo "Bo"
-
-}
-function rsync-bu {
+function rsync {
         # ARGS:
 				# 1. name of "master" container for which backup is done
 				# 2. JSON object with parameters
+				# 3. mode: bu|restore
         create_bu_image
 				#remove_bu_container
 
@@ -178,7 +195,7 @@ docker run -d
 $src_dirs 
 -e PUID=1001 
 -e PGID=1001 
--e PASSWORD_ACCESS=true 
+-e PASSWORD_ACCESS=false
 -e USER_PASSWORD=boo 
 -e USER_NAME=${bu_username}
 -e PUBLIC_KEY="$(cat ~/.ssh/id_rsa.pub)" 
@@ -189,18 +206,22 @@ DOCKER_RUN_END
 
                   ! { ssh ${REMOTE_HOST} docker ps | grep $CONT_BU -q; } \
 									&& ssh ${REMOTE_HOST}  "$docker_cmd" \
-									&& echo "created bu container $CONT_BU" \
-									&& echo re-run backup script \
+									&& log 2 "created bu container $CONT_BU" \
+									&& log 2 "re-run backup script  for $bu_cont / rsync task to complete backup" \
 									&& return
-#For unknown reason ssh command run after container creation by "docker run"
+#For unknown reason ssh command if run after container creation by "docker run"
 # usually fails even if delayed for 3-5 sec.
 
 					for src_dir in $(echo $src_dirs|sed 's/-v/\n/g'|sed '/^ *$/d'|sed 's/.*://'); do
 #									echo "!!!>${src_dir}<"
 
+               if [[ $3 == 'bu' ]]; then
                   rsync --rsh="ssh -p2222 -J ${REMOTE_HOST} ${SSH_LOCAL_CONF}" \
 													-avzH --delete "${bu_username}@localhost:${src_dir}"  \
 													"${bu_local_dir}/" 
+				       else
+											 echo 'here'
+							 fi
 					done
 }
 
@@ -213,34 +234,49 @@ function rsync-restore {
 
 
 function main {
+  #apply filter by container name
+	#https://stackoverflow.com/questions/29518137/jq-selecting-a-subset-of-keys-from-an-object
+#	local bu_conts="$(jq -r --args keys $(echo $CONTAINERS|jq -R 'split(",")') \
+#					'.containers|with_entries(select(
+#						.key as $k| any($keys |fromjson[]; .==$k)))' "$CONF_FL")"
+  
   for bu_cont in $(jq -r '.containers|keys[]' "$CONF_FL"); do
+    #FILTER: --name
+		[[ -n "$CONTAINERS" && ! "$CONTAINERS" =~ (^|,)$bu_cont(,|$) ]] && continue
     #stop container if required
-		local start_container=0
+		local restart_container=0
 		jq -er ".containers[\"${bu_cont}\"].conf?|select(.stop_before_bu==true)" "$CONF_FL">/dev/null \
-						&& echo "STOP CONTAINER $bu_cont" && docker stop $bu_cont && start_container=1
+						&& log 5 "STOP CONTAINER $bu_cont" \
+						&& docker stop $bu_cont >/dev/null  \
+						&& restart_container=1
 
 		for task_k in $(jq -r ".containers[\"${bu_cont}\"].tasks|keys[]" "$CONF_FL"); do
 			task=$(jq -r ".containers[\"${bu_cont}\"].tasks[$task_k]" "$CONF_FL")
 			echo "$task" | jq -e '.skip?==true' >/dev/null && continue
+      #FILTER: --tags
+			local bu_tag=$(echo "$task" | jq -er '.tag?')  && \
+			[[ -n $bu_tag && -n "$TAGS" && ! "$TAGS" =~ (^|,)$bu_tag(,|$) ]] \
+					 && continue
 
 			task_f="$(echo "$task" | jq -r ".driver")-$bu_mode"
 
 			case $task_f in
 				"mysqldump-bu")
-								mysqldump-bu "$bu_cont" "$task"
+								mysqldump "$bu_cont" "$task" "bu"
 								;;
 				 mysqldump-restore)
-								 mysqldump-restore "$bu_cont" "$task"
+								 mysqldump "$bu_cont" "$task" "restore"
 								 ;;
 				"rsync-bu")
-								rsync-bu "$bu_cont" "$task"
+								rsync "$bu_cont" "$task" "bu"
 								;;
 				 rsync-restore)
-								rsync-restore "$bu_cont" "$task"
+								rsync "$bu_cont" "$task" "restore"
 								;;
 			esac
 		done
-		[[ start_container -eq 1 ]] && docker start $bu_cont && start_container=0
+		[[ restart_container -eq 1 ]] &&  log 5 "START CONTAINER $bu_cont" \
+						&& docker start $bu_cont >/dev/null && restart_container=0
   done
 }
 
