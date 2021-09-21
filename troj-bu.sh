@@ -97,7 +97,7 @@ function log {
         echo "${strZ:0:$1}$2"
 }
 
-function bu-local-dir {
+function bu_local_dir {
      # ARGS:
 		 # 1. name of "master" container for which backup is made
 		 # 2. JSON object with parameters
@@ -141,7 +141,7 @@ function check_container_is_on {
 		ssh 
 }
 ########################################################################################
-function mysqldump {
+function _mysqldump {
              # ARGS:
 						 # 1. name of "master" container for which backup is done
 				     # 2. JSON object with parameters
@@ -152,7 +152,7 @@ function mysqldump {
        local db_name=$(echo "$2" | jq -r .db)
    local db_username=$(echo "$2" | jq -r .username)
    local db_password=$(echo "$2" | jq -r .password)
-     local arch_file=$(bu-local-dir "$1" "$2")_backup.sql.gz
+     local arch_file=$(bu_local_dir "$1" "$2")_backup.sql.gz
   log 5 "mysqldump, $3| host:$db_cont / database:$db_name"
   
 	if [[ $3 == "bu" ]]; then
@@ -170,7 +170,7 @@ function mysqldump {
 
 }
 
-function rsync {
+function _rsync {
         # ARGS:
 				# 1. name of "master" container for which backup is done
 				# 2. JSON object with parameters
@@ -180,7 +180,7 @@ function rsync {
 
 				bu_cont="$1"
 				src_dirs="$(echo "$2" | jq -r .src[])"
-				bu_local_dir=$(bu-local-dir "$1" "$2") 
+				bu_local_dir=$(bu_local_dir "$1" "$2") 
 				bu_username="monkey"
 
 					local mount_dirs="$(ssh ${REMOTE_HOST} docker inspect ${1}|jq -r '.[].Mounts[]')"
@@ -204,13 +204,28 @@ $IMAGE_BU
 DOCKER_RUN_END
 )
 
-                  ! { ssh ${REMOTE_HOST} docker ps | grep $CONT_BU -q; } \
-									&& ssh ${REMOTE_HOST}  "$docker_cmd" \
-									&& log 2 "created bu container $CONT_BU" \
-									&& log 2 "re-run backup script  for $bu_cont / rsync task to complete backup" \
-									&& return
+# check if container exist
+local bu_c_status=$(ssh ${REMOTE_HOST} "docker ps -a --filter name=$CONT_BU --format {{.Status}}")
+        case $bu_c_status in
+								'')
+												#container do not exist
+												ssh ${REMOTE_HOST} "$docker_cmd" \
+												&& log 2 "created bu container $CONT_BU" \
+												&& log 2 "re-run backup for $bu_cont / rsync task to complete backup" \
+												&& return
 #For unknown reason ssh command if run after container creation by "docker run"
 # usually fails even if delayed for 3-5 sec.
+												;;
+								Up*)
+												#container is running, continue backup
+												;;
+								*)
+												#container is down. Start it and go on
+												ssh ${REMOTE_HOST} "docker start $CONT_BU" \
+												&& sleep 5
+												;;
+				esac
+
 
 					for src_dir in $(echo $src_dirs|sed 's/-v/\n/g'|sed '/^ *$/d'|sed 's/.*://'); do
 #									echo "!!!>${src_dir}<"
@@ -220,15 +235,13 @@ DOCKER_RUN_END
 													-avzH --delete "${bu_username}@localhost:${src_dir}"  \
 													"${bu_local_dir}/" 
 				       else
-											 echo 'here'
+                  rsync --rsh="ssh -p2222 -J ${REMOTE_HOST} ${SSH_LOCAL_CONF}" \
+													-avzH --delete  "${bu_local_dir}" \
+													"${bu_username}@localhost:${src_dir}" 
 							 fi
 					done
 }
 
-
-function rsync-restore {
-     echo 'boo'
-}
 
 ########################################################################################
 
@@ -262,16 +275,16 @@ function main {
 
 			case $task_f in
 				"mysqldump-bu")
-								mysqldump "$bu_cont" "$task" "bu"
+								_mysqldump "$bu_cont" "$task" "bu"
 								;;
 				 mysqldump-restore)
-								 mysqldump "$bu_cont" "$task" "restore"
+								 _mysqldump "$bu_cont" "$task" "restore"
 								 ;;
 				"rsync-bu")
-								rsync "$bu_cont" "$task" "bu"
+								_rsync "$bu_cont" "$task" "bu"
 								;;
 				 rsync-restore)
-								rsync "$bu_cont" "$task" "restore"
+								_rsync "$bu_cont" "$task" "restore"
 								;;
 			esac
 		done
